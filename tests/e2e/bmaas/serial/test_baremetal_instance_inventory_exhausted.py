@@ -50,7 +50,6 @@ def _cleanup_bmi(*, cli: OsacCLI, grpc: GRPCClient, k8s: K8sClient, bmi_id: str)
     wait_for_bmi_grpc_removal(grpc=grpc, uuid=bmi_id)
 
 
-@pytest.mark.regression
 def test_baremetal_instance_inventory_exhausted(
     cli: OsacCLI,
     grpc: GRPCClient,

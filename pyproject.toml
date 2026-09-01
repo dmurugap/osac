@@ -17,10 +17,6 @@ include = ["tests*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-n 4 --dist loadfile"
-markers = [
-    "sanity: fast/essential e2e coverage for PR checks",
-    "regression: heavier or cross-flow e2e for periodic runs",
-]
 log_level = "INFO"
 log_cli = true
 log_cli_date_format = "%Y-%m-%dT%H:%M:%S%z"

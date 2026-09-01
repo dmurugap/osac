@@ -82,7 +82,6 @@ def _get_status_restart_trigger(grpc: GRPCClient, bmi_id: str) -> int:
     return int(response.get("object", {}).get("status", {}).get("restartTrigger", "0"))
 
 
-@pytest.mark.sanity
 def test_baremetal_instance_lifecycle(
     cli: OsacCLI,
     grpc: GRPCClient,
@@ -183,7 +182,6 @@ def test_baremetal_instance_lifecycle(
         raise
 
 
-@pytest.mark.sanity
 def test_baremetal_instance_restart(
     cli: OsacCLI,
     grpc: GRPCClient,

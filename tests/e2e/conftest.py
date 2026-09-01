@@ -35,6 +35,45 @@ def default_storage_tier() -> str:
     return env("OSAC_STORAGE_TIER", "local")
 
 
+def _bmaas_requires_serial_xdist(args: list[str]) -> bool:
+    """True when CLI targets BMaaS serial or the full e2e/bmaas suite.
+
+    Inventory exhaust lives in ``tests/e2e/bmaas/serial`` and must run ``-n 0``.
+    Sanity and regression stay on pyproject ``-n 4``. Broader invocations like
+    ``pytest tests/`` are not detected.
+    """
+    normalized = [str(a).replace("\\", "/").rstrip("/") for a in args]
+    if not normalized:
+        return False
+    return any(
+        a.endswith("e2e/bmaas/serial")
+        or "/e2e/bmaas/serial/" in (a + "/")
+        or a.endswith("tests/e2e/bmaas")
+        or a.endswith("/e2e/bmaas")
+        or a == "e2e/bmaas"
+        for a in normalized
+    )
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_cmdline_main(config: pytest.Config) -> None:
+    """Force serial xdist before xdist's cmdline hook creates worker specs.
+
+    pyproject ``addopts -n 4`` is already parsed; setting ``numprocesses`` in
+    ``pytest_configure`` is too late because xdist's ``tryfirst`` cmdline hook
+    has already populated ``config.option.tx``. Must return None (cmdline_main
+    is firstresult).
+    """
+    if not _bmaas_requires_serial_xdist(list(config.args or [])):
+        return None
+    config.option.numprocesses = 0
+    if hasattr(config.option, "dist"):
+        config.option.dist = "no"
+    if hasattr(config.option, "tx"):
+        config.option.tx = []
+    return None
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Give each xdist worker its own log_file so records stay chronologically ordered.
 

@@ -5,7 +5,7 @@ from typing import Any, ClassVar
 
 import pytest
 
-from tests.e2e.bmaas.networking import bmi_ssh
+from tests.e2e.bmaas.regression.networking import bmi_ssh
 from tests.e2e.core.grpc_client import GRPCClient
 from tests.e2e.core.helpers import (
     wait_for_bmh_available,

@@ -53,7 +53,7 @@ def ssh_bmi_unchecked(bmc_ip: str, command: str, timeout: int = 30) -> tuple[str
             check=False,
         )
     except subprocess.TimeoutExpired:
-        log.warning("ssh_bmi_unchecked(%s): subprocess timed out after %ds", bmc_ip, timeout)
+        log.warning("ssh_bmi_unchecked: subprocess timed out after %ds", timeout)
         return f"ssh timed out after {timeout}s", 255
     return (result.stdout.strip() + "\n" + result.stderr.strip()).strip(), result.returncode
 
