@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 import yaml
@@ -21,6 +22,36 @@ from tests.e2e.core.runner import env
 class K8sApiResponse:
     status: int
     body: dict[str, Any] | list[Any] | str
+
+
+def _cluster_and_user(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    current = cfg.get("current-context")
+    if not current:
+        raise RuntimeError("kubeconfig has no current-context")
+    contexts = {c["name"]: c["context"] for c in cfg.get("contexts") or []}
+    ctx = contexts.get(current)
+    if not ctx:
+        raise RuntimeError(f"kubeconfig current-context {current!r} not found")
+    cluster_name, user_name = ctx.get("cluster"), ctx.get("user")
+    clusters = {c["name"]: c["cluster"] for c in cfg.get("clusters") or []}
+    users = {u["name"]: u["user"] for u in cfg.get("users") or []}
+    cluster, user = clusters.get(cluster_name), users.get(user_name)
+    if cluster is None or user is None:
+        raise RuntimeError(f"kubeconfig context {current!r} is missing cluster or user")
+    return cluster, user
+
+
+def _require_https(server: str) -> str:
+    parsed = urlparse(server)
+    if parsed.scheme != "https":
+        raise RuntimeError(f"kube-apiserver URL must be https, got {parsed.scheme!r}")
+    return server
+
+
+def _ssl_context_with_ca(ca_path: str) -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    ctx.load_verify_locations(cafile=ca_path)
+    return ctx
 
 
 @dataclass
@@ -36,9 +67,8 @@ class K8sApiClient:
     def from_kubeconfig(cls, kubeconfig: str | None = None) -> K8sApiClient:
         path = Path(kubeconfig or env("KUBECONFIG", str(Path.home() / ".kube/config")))
         cfg = yaml.safe_load(path.read_text())
-        cluster = cfg["clusters"][0]["cluster"]
-        user = cfg["users"][0]["user"]
-        server = cluster["server"].rstrip("/")
+        cluster, user = _cluster_and_user(cfg)
+        server = _require_https(cluster["server"].rstrip("/"))
 
         ca_path: str | None = None
         ctx = ssl.create_default_context()
@@ -51,21 +81,26 @@ class K8sApiClient:
             ca_path = ca_file_path
             ctx.load_verify_locations(cafile=ca_path)
         else:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+            raise RuntimeError("kubeconfig cluster has no certificate-authority")
 
         auth_header: str | None = None
         if token := user.get("token"):
             auth_header = f"Bearer {token}"
         elif "client-certificate-data" in user and "client-key-data" in user:
-            with (
-                tempfile.NamedTemporaryFile(delete=False, suffix=".crt") as cert_file,
-                tempfile.NamedTemporaryFile(delete=False, suffix=".key") as key_file,
-            ):
-                cert_file.write(base64.b64decode(user["client-certificate-data"]))
-                key_file.write(base64.b64decode(user["client-key-data"]))
-                cert_path, key_path = cert_file.name, key_file.name
-            ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+            cert_path = key_path = None
+            try:
+                with (
+                    tempfile.NamedTemporaryFile(delete=False, suffix=".crt") as cert_file,
+                    tempfile.NamedTemporaryFile(delete=False, suffix=".key") as key_file,
+                ):
+                    cert_file.write(base64.b64decode(user["client-certificate-data"]))
+                    key_file.write(base64.b64decode(user["client-key-data"]))
+                    cert_path, key_path = cert_file.name, key_file.name
+                ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+            finally:
+                for tmp in (cert_path, key_path):
+                    if tmp:
+                        Path(tmp).unlink(missing_ok=True)
         else:
             raise RuntimeError("kubeconfig user has neither token nor client certificate")
 
@@ -73,24 +108,24 @@ class K8sApiClient:
 
     def anonymous_client(self) -> K8sApiClient:
         """Client with cluster CA only — no bearer token and no client certificate."""
-        ctx = ssl.create_default_context()
-        if self._ca_path:
-            ctx.load_verify_locations(cafile=self._ca_path)
-        else:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-        return K8sApiClient(server=self.server, _ssl_context=ctx, _auth_header=None, _ca_path=self._ca_path)
+        if not self._ca_path:
+            raise RuntimeError("kube-apiserver client has no CA path")
+        return K8sApiClient(
+            server=self.server,
+            _ssl_context=_ssl_context_with_ca(self._ca_path),
+            _auth_header=None,
+            _ca_path=self._ca_path,
+        )
 
     def with_bearer_token(self, token: str) -> K8sApiClient:
         """Client authenticated with a bearer token (no inherited client certificate)."""
-        ctx = ssl.create_default_context()
-        if self._ca_path:
-            ctx.load_verify_locations(cafile=self._ca_path)
-        else:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+        if not self._ca_path:
+            raise RuntimeError("kube-apiserver client has no CA path")
         return K8sApiClient(
-            server=self.server, _ssl_context=ctx, _auth_header=f"Bearer {token}", _ca_path=self._ca_path
+            server=self.server,
+            _ssl_context=_ssl_context_with_ca(self._ca_path),
+            _auth_header=f"Bearer {token}",
+            _ca_path=self._ca_path,
         )
 
     def request(

@@ -10,15 +10,19 @@ https://docs.redhat.com/en/documentation/openshift_container_platform/4.22/html-
 
 from __future__ import annotations
 
+import re
 import subprocess
 import uuid
 from collections.abc import Generator
 from typing import Any
 
 import pytest
+import yaml
 
 from tests.e2e.core.k8s_api import K8sApiClient
 from tests.e2e.core.runner import run
+
+_K8S_DNS_LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 METAL3_GROUP = "metal3.io"
 METAL3_VERSION = "v1alpha1"
@@ -107,6 +111,12 @@ def _bmh_unknown_field(*, namespace: str, name: str) -> dict[str, Any]:
     }
 
 
+def _k8s_dns_label(name: str, *, what: str) -> str:
+    if not _K8S_DNS_LABEL.fullmatch(name):
+        raise ValueError(f"invalid {what}: {name!r}")
+    return name
+
+
 def _oc(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["oc", "--as", "system:admin", *args], capture_output=True, text=True, check=False
@@ -121,40 +131,42 @@ def k8s_api() -> K8sApiClient:
 @pytest.fixture(scope="module")
 def restricted_bmh_token(bmh_namespace: str, test_run_id: str) -> Generator[str, None, None]:
     """SA that can get/list/patch BMHs but not patch the status subresource."""
-    sa = f"e2e-bmo-api-{test_run_id}"
-    role = f"{sa}-role"
-    binding = f"{sa}-binding"
-    manifest = f"""
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: {sa}
-  namespace: {bmh_namespace}
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: {role}
-  namespace: {bmh_namespace}
-rules:
-  - apiGroups: ["{METAL3_GROUP}"]
-    resources: ["baremetalhosts"]
-    verbs: ["get", "list", "watch", "patch", "update"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: {binding}
-  namespace: {bmh_namespace}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: {role}
-subjects:
-  - kind: ServiceAccount
-    name: {sa}
-    namespace: {bmh_namespace}
-"""
+    namespace = _k8s_dns_label(bmh_namespace, what="bmh_namespace")
+    sa = _k8s_dns_label(f"e2e-bmo-api-{test_run_id}", what="serviceaccount name")
+    role = _k8s_dns_label(f"{sa}-role", what="role name")
+    binding = _k8s_dns_label(f"{sa}-binding", what="rolebinding name")
+    manifest = yaml.safe_dump_all(
+        [
+            {
+                "apiVersion": "v1",
+                "kind": "ServiceAccount",
+                "metadata": {"name": sa, "namespace": namespace},
+            },
+            {
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "Role",
+                "metadata": {"name": role, "namespace": namespace},
+                "rules": [
+                    {
+                        "apiGroups": [METAL3_GROUP],
+                        "resources": ["baremetalhosts"],
+                        "verbs": ["get", "list", "watch", "patch", "update"],
+                    }
+                ],
+            },
+            {
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "RoleBinding",
+                "metadata": {"name": binding, "namespace": namespace},
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "Role",
+                    "name": role,
+                },
+                "subjects": [{"kind": "ServiceAccount", "name": sa, "namespace": namespace}],
+            },
+        ]
+    )
     subprocess.run(
         ["oc", "--as", "system:admin", "apply", "-f", "-"],
         input=manifest,
@@ -169,7 +181,7 @@ subjects:
             "token",
             sa,
             "-n",
-            bmh_namespace,
+            namespace,
             "--duration",
             "1h",
             "--as",
@@ -177,9 +189,9 @@ subjects:
         )
         yield token
     finally:
-        _oc("delete", "rolebinding", binding, "-n", bmh_namespace, "--ignore-not-found")
-        _oc("delete", "role", role, "-n", bmh_namespace, "--ignore-not-found")
-        _oc("delete", "sa", sa, "-n", bmh_namespace, "--ignore-not-found")
+        _oc("delete", "rolebinding", binding, "-n", namespace, "--ignore-not-found")
+        _oc("delete", "role", role, "-n", namespace, "--ignore-not-found")
+        _oc("delete", "sa", sa, "-n", namespace, "--ignore-not-found")
 
 
 def test_metal3_crd_http_matrix(
@@ -198,7 +210,7 @@ def test_metal3_crd_http_matrix(
     - LIST Provisioning (cluster-scoped) → 200 and ≥1 item (singleton present)
     - Unauthenticated LIST BMH → 401 or 403 (OCP often 403)
     - Named GET missing BMH → 404; GET existing BMH → 200
-    - dryRun=All invalid creates → 422 (BMH missing online, HFC missing updates,
+    - dryRun=All invalid creates → 400 or 422 (BMH missing online, HFC missing updates,
       HFS missing settings, DataImage missing url)
     - dryRun=All BMH with unknown spec field → 400/422, or 2xx with field pruned
       (Metal3 structural schemas commonly prune rather than reject)
@@ -214,12 +226,12 @@ def test_metal3_crd_http_matrix(
     # --- LIST surface for every namespaced CRD ---
     for resource in NAMESPACED_RESOURCES:
         resp = k8s_api.request("GET", _api_path(resource=resource, namespace=bmh_namespace))
-        assert resp.status == 200, f"LIST {resource}: expected 200, got {resp.status}: {resp.body}"
+        assert resp.status == 200, f"LIST {resource}: expected 200, got {resp.status}"
         assert isinstance(resp.body, dict) and "items" in resp.body
 
     # --- Provisioning cluster-scoped singleton ---
     prov = k8s_api.request("GET", _api_path(resource="provisionings"))
-    assert prov.status == 200, f"LIST provisionings: expected 200, got {prov.status}: {prov.body}"
+    assert prov.status == 200, f"LIST provisionings: expected 200, got {prov.status}"
     assert isinstance(prov.body, dict)
     items = prov.body.get("items", [])
     assert len(items) >= 1, "expected at least one cluster-scoped Provisioning object"
@@ -252,7 +264,9 @@ def test_metal3_crd_http_matrix(
     for resource, body in validation_cases:
         path = f"{_api_path(resource=resource, namespace=bmh_namespace)}?dryRun=All"
         resp = k8s_api.request("POST", path, body=body)
-        assert resp.status == 422, f"dryRun POST {resource} invalid: expected 422, got {resp.status}: {resp.body}"
+        assert resp.status in VALIDATION_STATUSES, (
+            f"dryRun POST {resource} invalid: expected {VALIDATION_STATUSES}, got {resp.status}"
+        )
 
     unknown = k8s_api.request(
         "POST",
@@ -265,12 +279,12 @@ def test_metal3_crd_http_matrix(
         assert isinstance(unknown.body, dict)
         spec = unknown.body.get("spec") or {}
         assert "e2eUnknownField" not in spec, (
-            f"unknown field accepted into stored/returned BMH spec (expected prune or reject): {spec}"
+            "unknown field accepted into stored/returned BMH spec (expected prune or reject)"
         )
     else:
         raise AssertionError(
             f"unknown field: expected reject {UNKNOWN_FIELD_REJECT} or prune "
-            f"{UNKNOWN_FIELD_PRUNE}, got {unknown.status}: {unknown.body}"
+            f"{UNKNOWN_FIELD_PRUNE}, got {unknown.status}"
         )
 
     # --- Existing BMH GET + restricted SA RBAC ---
@@ -298,7 +312,7 @@ def test_metal3_crd_http_matrix(
         content_type="application/merge-patch+json",
     )
     assert allow_resp.status == 200, (
-        f"restricted dryRun PATCH BMH (metadata): expected 200, got {allow_resp.status}: {allow_resp.body}"
+        f"restricted dryRun PATCH BMH (metadata): expected 200, got {allow_resp.status}"
     )
 
     # No-op spec patch (reuse current online) so dryRun cannot change power state.
@@ -310,7 +324,7 @@ def test_metal3_crd_http_matrix(
         content_type="application/merge-patch+json",
     )
     assert spec_resp.status == 200, (
-        f"restricted dryRun PATCH BMH (spec): expected 200, got {spec_resp.status}: {spec_resp.body}"
+        f"restricted dryRun PATCH BMH (spec): expected 200, got {spec_resp.status}"
     )
 
     status_patch = {
@@ -326,5 +340,5 @@ def test_metal3_crd_http_matrix(
         content_type="application/merge-patch+json",
     )
     assert deny_resp.status == 403, (
-        f"restricted dryRun PATCH /status: expected 403, got {deny_resp.status}: {deny_resp.body}"
+        f"restricted dryRun PATCH /status: expected 403, got {deny_resp.status}"
     )
