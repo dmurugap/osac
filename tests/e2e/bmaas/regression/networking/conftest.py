@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 
@@ -55,6 +56,34 @@ def catalog_item_name() -> str:
 
 
 @pytest.fixture(scope="session")
+def bmi_instance_type() -> str:
+    return env("OSAC_BMI_INSTANCE_TYPE", env("OSAC_BM_HOST_TYPE", "default"))
+
+
+@pytest.fixture(scope="session")
+def bmi_user_data() -> str:
+    path = os.environ.get("OSAC_BMI_USER_DATA_FILE", "").strip()
+    if path:
+        return Path(path).read_text()
+    inline = os.environ.get("OSAC_BMI_USER_DATA", "").strip()
+    if inline:
+        return inline
+    return "#cloud-config\nmanage_etc_hosts: false\n"
+
+
+@pytest.fixture(scope="session")
 def net_ssh_public_key() -> str:
-    key_path = Path(env("OSAC_BMI_SSH_PUBLIC_KEY", "/root/.ssh/id_rsa.pub"))
-    return key_path.read_text().strip()
+    """Pubkey injected into the BMI must match OSAC_BMI_SSH_IDENTITY used by guest_ssh.
+
+    OSAC_BMI_SSH_PUBLIC_KEY may be a file path or the key material (ssh-ed25519 …).
+    """
+    explicit = os.environ.get("OSAC_BMI_SSH_PUBLIC_KEY", "").strip()
+    if explicit:
+        if explicit.startswith(("ssh-", "ecdsa-", "sk-")):
+            return explicit
+        return Path(explicit).read_text().strip()
+    identity = os.environ.get("OSAC_BMI_SSH_IDENTITY", "/root/.ssh/id_rsa")
+    pub = Path(identity + ".pub")
+    if pub.is_file():
+        return pub.read_text().strip()
+    return Path(env("OSAC_BMI_SSH_PUBLIC_KEY", "/root/.ssh/id_rsa.pub")).read_text().strip()
