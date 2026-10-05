@@ -52,7 +52,7 @@ def ssh_unchecked(host: str, command: str, timeout: int = 30) -> tuple[str, int]
     except subprocess.TimeoutExpired:
         return f"ssh timed out after {timeout}s", 255
     out = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
-    log.info("guest ssh %s rc=%s cmd=%s", host, result.returncode, command)
+    log.info("guest ssh rc=%s cmd=%s", result.returncode, command)
     return out, result.returncode
 
 

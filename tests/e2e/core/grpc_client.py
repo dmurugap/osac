@@ -273,6 +273,20 @@ class GRPCClient:
                     continue
                 raise RuntimeError(f"Failed to create tenant '{name}': {output}") from e
 
+    def find_tenant_id(self, *, name: str) -> str:
+        """Return the tenant UUID for ``name``, or empty string if it is missing."""
+        items = self.list_with_filter(
+            service=f"{PRIVATE_API}.Tenants/List", filter_expr=f'this.metadata.name == "{name}"'
+        )
+        if not items:
+            response: dict[str, Any] = self.call(service=f"{PRIVATE_API}.Tenants/List")
+            items = [
+                item
+                for item in response.get("items", [])
+                if item.get("metadata", {}).get("name") == name
+            ]
+        return str(items[0]["id"]) if items and items[0].get("id") else ""
+
     # ExternalIPPool operations (private API only)
 
     def create_external_ip_pool(
