@@ -279,12 +279,18 @@ class GRPCClient:
             service=f"{PRIVATE_API}.Tenants/List", filter_expr=f'this.metadata.name == "{name}"'
         )
         if not items:
-            response: dict[str, Any] = self.call(service=f"{PRIVATE_API}.Tenants/List")
-            items = [
-                item
-                for item in response.get("items", [])
-                if item.get("metadata", {}).get("name") == name
-            ]
+            items = []
+            offset = 0
+            while True:
+                response: dict[str, Any] = self.call(
+                    service=f"{PRIVATE_API}.Tenants/List",
+                    data={"offset": offset, "limit": 100},
+                )
+                page = response.get("items", [])
+                items.extend(item for item in page if item.get("metadata", {}).get("name") == name)
+                offset += len(page)
+                if not page or offset >= int(response.get("total", 0)):
+                    break
         return str(items[0]["id"]) if items and items[0].get("id") else ""
 
     # ExternalIPPool operations (private API only)
@@ -693,7 +699,9 @@ class GRPCClient:
         if disk_image:
             spec["disk_image"] = {"name": disk_image, "shared": True}
         if instance_type:
-            spec["instance_type"] = {"name": instance_type}
+            # BareMetalInstanceType lives in shared; LocalReference has no shared
+            # field in proto, but the JSON mapping accepts it for name lookup.
+            spec["instance_type"] = {"name": instance_type, "shared": True}
         if user_data:
             spec["user_data"] = user_data
         try:
@@ -702,8 +710,8 @@ class GRPCClient:
                 data={"object": {"metadata": _metadata(name=name, tenant=tenant), "spec": spec}},
             )
         except subprocess.CalledProcessError as e:
-            detail = (e.output or e.stderr or str(e)).strip()
-            raise RuntimeError(f"BareMetalInstances/Create {name} tenant={tenant}: {detail}") from e
+            detail = re.sub(r"Bearer \S+", "Bearer [REDACTED]", (e.output or e.stderr or str(e)).strip())
+            raise RuntimeError(f"BareMetalInstances/Create {name} tenant={tenant}: {detail}") from None
         return response["object"]["id"]
 
     def list_baremetal_instance_ids(self, *, filter_expr: str | None = None) -> list[str]:

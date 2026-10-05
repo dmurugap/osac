@@ -122,6 +122,7 @@ def _create_bmi(
     disk_image: str | None,
     user_data: str,
     auto_eip: bool,
+    instance_type: str | None = None,
 ) -> str:
     """Create a BMI. If auto_eip, set spec.auto_external_ip_attachment unless the catalog locks it."""
     kwargs: dict[str, Any] = {
@@ -133,6 +134,7 @@ def _create_bmi(
         "tenant": tenant,
         "disk_image": disk_image,
         "user_data": user_data,
+        "instance_type": instance_type,
     }
     if not auto_eip:
         return grpc.create_baremetal_instance(**kwargs)
@@ -251,21 +253,33 @@ def _teardown_owned_resources(
     """Delete only IDs recorded in ``state``. Safe on a partial run."""
     if state.get("_teardown_done"):
         return
+    errors: list[BaseException] = []
+
+    def _phase(fn) -> None:  # noqa: ANN001
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 — keep remaining teardown phases
+            errors.append(exc)
+
     if "ingress_attach_id" in state:
         aid = state["ingress_attach_id"]
-        _wait_owned_gone(
-            description=f"ingress attachment {aid} gone",
-            api_gone=lambda: aid not in grpc.list_external_ip_attachment_ids(),
-            cr_gone=lambda: k8s.get_external_ip_attachment_name(uuid=aid, checked=False) == "",
-            delete=lambda: grpc.delete_external_ip_attachment(attachment_id=aid),
+        _phase(
+            lambda: _wait_owned_gone(
+                description=f"ingress attachment {aid} gone",
+                api_gone=lambda: aid not in grpc.list_external_ip_attachment_ids(),
+                cr_gone=lambda: k8s.get_external_ip_attachment_name(uuid=aid, checked=False) == "",
+                delete=lambda: grpc.delete_external_ip_attachment(attachment_id=aid),
+            )
         )
     if "ingress_eip_id" in state:
         eip_id = state["ingress_eip_id"]
-        _wait_owned_gone(
-            description=f"ingress EIP {eip_id} gone",
-            api_gone=lambda: eip_id not in grpc.list_external_ip_ids(),
-            cr_gone=lambda: k8s.get_external_ip_name(uuid=eip_id, checked=False) == "",
-            delete=lambda: grpc.delete_external_ip(external_ip_id=eip_id),
+        _phase(
+            lambda: _wait_owned_gone(
+                description=f"ingress EIP {eip_id} gone",
+                api_gone=lambda: eip_id not in grpc.list_external_ip_ids(),
+                cr_gone=lambda: k8s.get_external_ip_name(uuid=eip_id, checked=False) == "",
+                delete=lambda: grpc.delete_external_ip(external_ip_id=eip_id),
+            )
         )
 
     for key in ("t2_b", "t1_a"):
@@ -273,18 +287,22 @@ def _teardown_owned_resources(
         auto_attach_id = bmi.get("auto_attach_id")
         auto_eip_id = bmi.get("auto_eip_id")
         if auto_attach_id:
-            _wait_owned_gone(
-                description=f"{key} auto-EIP attachment gone",
-                api_gone=lambda aid=auto_attach_id: aid not in grpc.list_external_ip_attachment_ids(),
-                cr_gone=lambda aid=auto_attach_id: k8s.get_external_ip_attachment_name(uuid=aid, checked=False) == "",
-                delete=lambda aid=auto_attach_id: grpc.delete_external_ip_attachment(attachment_id=aid),
+            _phase(
+                lambda aid=auto_attach_id, k=key: _wait_owned_gone(
+                    description=f"{k} auto-EIP attachment gone",
+                    api_gone=lambda: aid not in grpc.list_external_ip_attachment_ids(),
+                    cr_gone=lambda: k8s.get_external_ip_attachment_name(uuid=aid, checked=False) == "",
+                    delete=lambda: grpc.delete_external_ip_attachment(attachment_id=aid),
+                )
             )
         if auto_eip_id:
-            _wait_owned_gone(
-                description=f"{key} auto-EIP gone",
-                api_gone=lambda eid=auto_eip_id: eid not in grpc.list_external_ip_ids(),
-                cr_gone=lambda eid=auto_eip_id: k8s.get_external_ip_name(uuid=eid, checked=False) == "",
-                delete=lambda eid=auto_eip_id: grpc.delete_external_ip(external_ip_id=eid),
+            _phase(
+                lambda eid=auto_eip_id, k=key: _wait_owned_gone(
+                    description=f"{k} auto-EIP gone",
+                    api_gone=lambda: eid not in grpc.list_external_ip_ids(),
+                    cr_gone=lambda: k8s.get_external_ip_name(uuid=eid, checked=False) == "",
+                    delete=lambda: grpc.delete_external_ip(external_ip_id=eid),
+                )
             )
 
     bmis = list(state.get("bmis") or [])
@@ -294,37 +312,47 @@ def _teardown_owned_resources(
         except Exception:  # noqa: BLE001 — already gone
             pass
     for bmi in bmis:
-        if bmi.get("cr"):
-            wait_for_bmi_deletion(k8s=k8s, name=bmi["cr"])
-        wait_for_bmi_grpc_removal(grpc=grpc, uuid=bmi["id"])
-        if bmi.get("bmh"):
-            wait_for_bmh_available(k8s=k8s, name=bmi["bmh"], bmh_namespace=bmh_namespace)
+
+        def _wait_bmi(target: dict[str, Any] = bmi) -> None:
+            if target.get("cr"):
+                wait_for_bmi_deletion(k8s=k8s, name=target["cr"])
+            wait_for_bmi_grpc_removal(grpc=grpc, uuid=target["id"])
+            if target.get("bmh"):
+                wait_for_bmh_available(k8s=k8s, name=target["bmh"], bmh_namespace=bmh_namespace)
+
+        _phase(_wait_bmi)
 
     stacks = [net for net in (state.get("t1_net"), state.get("t2_net")) if net]
     for net in stacks:
-        _teardown_nat(grpc, k8s, net)
+        _phase(lambda n=net: _teardown_nat(grpc, k8s, n))
     for net in stacks:
-        _teardown_nat_eip(grpc, k8s, net)
+        _phase(lambda n=net: _teardown_nat_eip(grpc, k8s, n))
     for net in stacks:
-        _teardown_sg(grpc, k8s, net)
+        _phase(lambda n=net: _teardown_sg(grpc, k8s, n))
     for net in stacks:
-        _teardown_subnets(grpc, k8s, net)
+        _phase(lambda n=net: _teardown_subnets(grpc, k8s, n))
     for net in stacks:
-        _teardown_vnet(grpc, k8s, net)
+        _phase(lambda n=net: _teardown_vnet(grpc, k8s, n))
 
     if state.get("pool_owned") and state.get("pool_id"):
         pool_id = state["pool_id"]
-        try:
-            grpc.delete_external_ip_pool(pool_id=pool_id)
-        except Exception:  # noqa: BLE001 — already gone
-            pass
-        _wait_owned_gone(
-            description=f"ExternalIPPool {pool_id} gone",
-            api_gone=lambda: pool_id not in grpc.list_external_ip_pool_ids(),
-            cr_gone=lambda: k8s.get_external_ip_pool_name(uuid=pool_id, checked=False) == "",
-            retries=_FABRIC_RETRIES,
-        )
+
+        def _wait_pool() -> None:
+            try:
+                grpc.delete_external_ip_pool(pool_id=pool_id)
+            except Exception:  # noqa: BLE001 — already gone
+                pass
+            _wait_owned_gone(
+                description=f"ExternalIPPool {pool_id} gone",
+                api_gone=lambda: pool_id not in grpc.list_external_ip_pool_ids(),
+                cr_gone=lambda: k8s.get_external_ip_pool_name(uuid=pool_id, checked=False) == "",
+                retries=_FABRIC_RETRIES,
+            )
+
+        _phase(_wait_pool)
     state["_teardown_done"] = True
+    if errors:
+        raise RuntimeError(f"{len(errors)} teardown phase(s) failed: {errors[0]}") from errors[0]
 
 
 class TestCrossTenantBmaasNetworking:
@@ -499,6 +527,7 @@ class TestCrossTenantBmaasNetworking:
         net_test_run_id: str,
         bmh_ssh_hosts: dict[str, str],
         bmi_user_data: str,
+        bmi_instance_type: str,
     ) -> None:
         _require(self.state, "t2_net", "t1_net")
         t2 = self.state["t2_net"]
@@ -530,9 +559,6 @@ class TestCrossTenantBmaasNetworking:
         bmis: list[dict[str, Any]] = list(self.__class__.state.get("bmis") or [])
         for key, name_prefix, tenant, catalog, subnet, sg, auto_eip, ip_prefix in specs:
             name = f"{name_prefix}-{net_test_run_id}"
-            # BareMetalInstanceType is always tenant=shared, but BMI spec.instance_type is a
-            # LocalReference (tenant/project of the BMI). Name/id lookup in tenant2 fails.
-            # Omit it; host selection uses the catalog template host_type.
             bmi_id = _create_bmi(
                 private_grpc,
                 name=name,
@@ -544,6 +570,7 @@ class TestCrossTenantBmaasNetworking:
                 disk_image=disk_image,
                 user_data=bmi_user_data,
                 auto_eip=auto_eip,
+                instance_type=bmi_instance_type,
             )
             assert tenant != "shared"
             rec = {
