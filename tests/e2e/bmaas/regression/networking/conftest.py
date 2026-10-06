@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from tests.e2e.bmaas.regression.networking import bmi_ssh
+from tests.e2e.core.grpc_client import GRPCClient
 from tests.e2e.core.runner import env
 
 
@@ -56,8 +57,19 @@ def catalog_item_name() -> str:
 
 
 @pytest.fixture(scope="session")
-def bmi_instance_type() -> str:
-    return env("OSAC_BMI_INSTANCE_TYPE", env("OSAC_BM_HOST_TYPE", "default"))
+def bmi_instance_type(private_grpc: GRPCClient) -> str:
+    """Send spec.instance_type only when that BareMetalInstanceType exists.
+
+    Labs often export OSAC_BMI_INSTANCE_TYPE=default even when no types are cataloged.
+    """
+    requested = (
+        os.environ.get("OSAC_BMI_INSTANCE_TYPE", "").strip() or os.environ.get("OSAC_BM_HOST_TYPE", "").strip()
+    )
+    if not requested:
+        return ""
+    items = private_grpc.call(service="osac.private.v1.BareMetalInstanceTypes/List").get("items") or []
+    names = {str((item.get("metadata") or {}).get("name") or "") for item in items}
+    return requested if requested in names else ""
 
 
 @pytest.fixture(scope="session")

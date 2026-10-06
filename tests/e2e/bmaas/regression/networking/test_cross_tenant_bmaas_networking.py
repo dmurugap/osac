@@ -359,11 +359,12 @@ class TestCrossTenantBmaasNetworking:
     state: ClassVar[dict[str, Any]] = {}
 
     @pytest.fixture(scope="class", autouse=True)
+    @classmethod
     def _owned_resource_finalizer(
-        self, private_grpc: GRPCClient, k8s_hub_client: K8sClient, bmh_namespace: str
+        cls, private_grpc: GRPCClient, k8s_hub_client: K8sClient, bmh_namespace: str
     ) -> Iterator[None]:
         yield
-        _teardown_owned_resources(self.state, private_grpc, k8s_hub_client, bmh_namespace)
+        _teardown_owned_resources(cls.state, private_grpc, k8s_hub_client, bmh_namespace)
 
     def test_00_resolve_tenants(self, private_grpc: GRPCClient) -> None:
         """Reuse session tenants (ensure_tenants: tenant1/tenant2). Do not create or delete them."""
