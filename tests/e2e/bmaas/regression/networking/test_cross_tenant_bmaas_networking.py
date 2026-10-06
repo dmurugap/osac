@@ -350,9 +350,9 @@ def _teardown_owned_resources(
             )
 
         _phase(_wait_pool)
-    state["_teardown_done"] = True
     if errors:
         raise RuntimeError(f"{len(errors)} teardown phase(s) failed: {errors[0]}") from errors[0]
+    state["_teardown_done"] = True
 
 
 class TestCrossTenantBmaasNetworking:
